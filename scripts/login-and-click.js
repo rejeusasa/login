@@ -79,7 +79,7 @@ function sleep(ms) {
 }
 
 function ignoredRequest(url) {
-  return /google-analytics|analytics\.google|doubleclick|googletagmanager|csp\.withgoogle\.com|play\.google\.com\/log|\/ccm\/collect|directaccessweb-pa\.googleapis\.com\/webrtc|www\.google\.com\/images\/cleardot\.gif/i
+  return /google-analytics|analytics\.google|doubleclick|googletagmanager|csp\.withgoogle\.com|play\.google\.com\/log|\/ccm\/collect|directaccessweb-pa\.googleapis\.com\/webrtc|www\.google\.com\/i[...]
     .test(url || '');
 }
 
@@ -533,7 +533,9 @@ async function runIsolatedSession({
   emailIndex,
   urlIndex,
   keepOpenMinutes,
-  reloadIntervalMinutes
+  reloadIntervalMinutes,
+  runDir,
+  allScreenshots
 }) {
   const prefix = `[email:${emailIndex}][url:${urlIndex}]`;
 
@@ -620,6 +622,27 @@ async function runIsolatedSession({
     }
   });
 
+  function makePublicLink(filePath) {
+    const publicBase = process.env.PUBLIC_BASE_URL;
+    const filename = path.basename(filePath);
+
+    if (publicBase) {
+      return `${publicBase.replace(/\/$/, '')}/${encodeURIComponent(filename)}`;
+    }
+
+    return `file://${path.resolve(filePath)}`;
+  }
+
+  async function safeScreenshotWithLink(page, filePath) {
+    await safeScreenshot(page, filePath);
+    try {
+      const link = makePublicLink(filePath);
+      allScreenshots.push({ filePath, link });
+    } catch (err) {
+      console.warn(`${prefix} Gagal membuat link untuk ${filePath}: ${err.message}`);
+    }
+  }
+
   try {
     await openTarget(page, targetUrl, prefix);
 
@@ -649,10 +672,19 @@ async function runIsolatedSession({
       );
     }
 
-    await safeScreenshot(
-      page,
-      `opened-email-${emailIndex}-url-${urlIndex}-${timestamp()}.png`
-    );
+    const openedPath = path.join(runDir, `opened-email-${emailIndex}-url-${urlIndex}-${timestamp()}.png`);
+    await safeScreenshotWithLink(page, openedPath);
+
+    // schedule a screenshot at minute 3 so you can verify page stayed loaded
+    const minute3Timer = setTimeout(async () => {
+      try {
+        const p = path.join(runDir, `minute-3-email-${emailIndex}-url-${urlIndex}-${timestamp()}.png`);
+        await safeScreenshotWithLink(page, p);
+        console.log(`${prefix} Screenshot minute-3 captured.`);
+      } catch (err) {
+        console.warn(`${prefix} Gagal capture minute-3: ${err.message}`);
+      }
+    }, 3 * 60 * 1000);
 
     const endAt = Date.now() + keepOpenMinutes * 60 * 1000;
     let nextReloadAt = Date.now() + reloadIntervalMinutes * 60 * 1000;
@@ -668,6 +700,11 @@ async function runIsolatedSession({
           Math.min(untilReload, untilEnd)
         )
       );
+
+      // optional lightweight progress log so you can see timing in logs
+      const secsUntilReload = Math.max(0, Math.round((nextReloadAt - Date.now()) / 1000));
+      const secsUntilEnd = Math.max(0, Math.round((endAt - Date.now()) / 1000));
+      console.log(`${prefix} sampai reload: ${secsUntilReload}s, sampai akhir: ${secsUntilEnd}s, waitTime=${waitTime}ms`);
 
       await sleep(waitTime);
 
@@ -712,26 +749,53 @@ async function runIsolatedSession({
 
           await page.waitForTimeout(5000);
 
-          await safeScreenshot(
-            page,
-            `reload-email-${emailIndex}-url-${urlIndex}-${timestamp()}.png`
-          );
+          const reloadPath = path.join(runDir, `reload-email-${emailIndex}-url-${urlIndex}-${timestamp()}.png`);
+          await safeScreenshotWithLink(page, reloadPath);
         } catch (error) {
           console.warn(`${prefix} Reload gagal: ${error.message}`);
           await saveDebug(page, emailIndex, urlIndex, 'reload-error');
         }
 
         nextReloadAt = Date.now() + reloadIntervalMinutes * 60 * 1000;
+        console.log(`${prefix} nextReloadAt di-set: ${new Date(nextReloadAt).toISOString()} (interval=${reloadIntervalMinutes}m)`);
       }
     }
 
     console.log(`${prefix} Session selesai.`);
+    clearTimeout(minute3Timer);
   } catch (error) {
     console.error(`${prefix} Error: ${error.stack || error}`);
 
     await saveDebug(page, emailIndex, urlIndex, 'error').catch(() => {});
   } finally {
     await context.close().catch(() => {});
+  }
+}
+
+function cleanupOldRuns(runsRoot, keepHours) {
+  try {
+    if (!fs.existsSync(runsRoot)) return;
+
+    const entries = fs.readdirSync(runsRoot, { withFileTypes: true });
+    const nowMs = Date.now();
+    const keepMs = keepHours * 60 * 60 * 1000;
+
+    for (const entry of entries) {
+      if (!entry.isDirectory()) continue;
+      const fullPath = path.join(runsRoot, entry.name);
+      try {
+        const st = fs.statSync(fullPath);
+        const mtime = st.mtimeMs || st.ctimeMs || st.birthtimeMs || 0;
+        if (nowMs - mtime > keepMs) {
+          console.log(`Menghapus run folder lama: ${fullPath}`);
+          fs.rmSync(fullPath, { recursive: true, force: true });
+        }
+      } catch (err) {
+        console.warn(`Gagal mengecek/hapus ${fullPath}: ${err.message}`);
+      }
+    }
+  } catch (err) {
+    console.warn(`cleanupOldRuns error: ${err.message}`);
   }
 }
 
@@ -748,8 +812,10 @@ async function runIsolatedSession({
 
   const reloadIntervalMinutes = Math.max(
     1,
-    parseInt(process.env.RELOAD_INTERVAL_MINUTES || '30', 10)
+    parseInt(process.env.RELOAD_INTERVAL_MINUTES || '15', 10)
   );
+
+  const runRetentionHours = Math.max(0, parseInt(process.env.RUN_RETENTION_HOURS || '12', 10));
 
   const accounts = parseAccounts(
     process.env.GMAIL_ACCOUNT_LIST
@@ -776,6 +842,19 @@ async function runIsolatedSession({
     { length: 5 },
     (_, index) => urls[index % urls.length]
   );
+
+  // cleanup old runs before creating a new one
+  const runsRoot = 'runs';
+  cleanupOldRuns(runsRoot, runRetentionHours);
+
+  // create a run folder per process run: runs/<timestamp>
+  const runFolderName = timestamp();
+  const runDir = path.join(runsRoot, runFolderName);
+  fs.mkdirSync(runDir, { recursive: true });
+  console.log(`Run folder dibuat: ${runDir}`);
+
+  // accumulator for all screenshots across parallel sessions
+  const allScreenshots = [];
 
   const tempDirectory = path.resolve('.runtime');
   fs.mkdirSync(tempDirectory, { recursive: true });
@@ -823,10 +902,28 @@ async function runIsolatedSession({
           emailIndex,
           urlIndex: index + 1,
           keepOpenMinutes,
-          reloadIntervalMinutes
+          reloadIntervalMinutes,
+          runDir,
+          allScreenshots
         })
       )
     );
+
+    // after all sessions finish, write links file in runDir
+    try {
+      const publicBase = process.env.PUBLIC_BASE_URL;
+      const lines = allScreenshots.map((s) => {
+        const name = path.basename(s.filePath);
+        const link = publicBase ? `${publicBase.replace(/\/$/, '')}/${encodeURIComponent(name)}` : `file://${path.resolve(s.filePath)}`;
+        return `${link}  ${name}`;
+      });
+
+      const linksPath = path.join(runDir, `links-${runFolderName}.txt`);
+      await fs.promises.writeFile(linksPath, lines.join('\n'));
+      console.log(`Links file dibuat: ${linksPath}`);
+    } catch (err) {
+      console.warn(`Gagal menulis links file di run folder: ${err.message}`);
+    }
   } finally {
     await browser.close().catch(() => {});
 
